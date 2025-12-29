@@ -7,6 +7,8 @@
 
 ## Build, Test, and Development Commands
 - `go build ./...` builds the binary and validates module compilation.
+- After any code change, run `go build -o mcp-sse-bridge .` to refresh the local binary.
+- Note: sandboxed runs may need permission to access the Go build cache outside the repo.
 - `go run ./...` runs the bridge locally for quick iteration.
 - Example run:
   ```bash
@@ -15,6 +17,10 @@
   go run ./...
   ```
 - Optional: `UPSTREAM_TIMEOUT=120s` overrides the upstream SSE response wait.
+- Optional: `FORWARD_INITIALIZE=true` forwards client `initialize` upstream (default false).
+- Optional: `RECONNECT_POST_DELAY_MS=300` delays the retry after reconnect.
+- Optional: `ONE_SHOT_TOOLS=true` runs each `tools/call` with a fresh SSE session.
+- Optional: `ONE_SHOT_MAX_RETRIES=3` controls one-shot retry attempts.
 
 ## Coding Style & Naming Conventions
 - Use standard Go formatting (`gofmt`); indentation is tabs by default.

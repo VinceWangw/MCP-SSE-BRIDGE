@@ -13,8 +13,10 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -52,7 +54,8 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	baseURL, endpointURL, sseMsgCh, err := connectLegacySSE(ctx, httpClient, remote, bearer, logger)
+	sseCtx, sseCancel := context.WithCancel(ctx)
+	baseURL, endpointURL, sseMsgCh, err := connectLegacySSE(sseCtx, httpClient, remote, bearer, logger)
 	if err != nil {
 		logger.Printf("failed to connect SSE: %v", err)
 		os.Exit(1)
@@ -61,49 +64,101 @@ func main() {
 
 	var (
 		mu      sync.Mutex
+		outMu   sync.Mutex
 		pending = map[string]chan JsonRPC{} // idKey -> response channel
 	)
-
-	// SSE reader goroutine: route responses by id
-	go func() {
-		for msg := range sseMsgCh {
-			if msg.ID == nil {
-				continue
-			}
-			idKey := idToKey(msg.ID)
-
-			mu.Lock()
-			ch := pending[idKey]
-			mu.Unlock()
-			if ch != nil {
-				select {
-				case ch <- msg:
-				default:
-				}
-			}
-		}
-
-		// If SSE closes, unblock all waiters with an error
-		mu.Lock()
-		for k, ch := range pending {
-			delete(pending, k)
-			_ = writeMessage(bufio.NewWriter(os.Stdout), JsonRPC{
-				JSONRPC: "2.0",
-				ID:      k,
-				Error: &RPCError{
-					Code:    -32000,
-					Message: "upstream SSE closed",
-				},
-			}, "jsonl")
-			close(ch)
-		}
-		mu.Unlock()
-	}()
+	initTracker := newUpstreamInitTracker()
+	forwardInit := envBool("FORWARD_INITIALIZE", false)
+	oneShotTools := envBool("ONE_SHOT_TOOLS", true)
 
 	// STDIO loop
 	in := bufio.NewReader(os.Stdin)
 	out := bufio.NewWriter(os.Stdout)
 	defer out.Flush()
+
+	// SSE reader goroutine: route responses by id
+	sseMgr := newSSEManager(endpointURL)
+	sseMgr.set(endpointURL, sseMsgCh, sseCancel)
+	go func() {
+		activeCh := sseMsgCh
+		for {
+			select {
+			case <-sseMgr.switchCh:
+				activeCh = sseMgr.msgCh()
+				select {
+				case sseMgr.switchAck <- struct{}{}:
+				default:
+				}
+				continue
+			case msg, ok := <-activeCh:
+				if !ok {
+					current := sseMgr.msgCh()
+					if current != nil && current != activeCh {
+						activeCh = current
+						continue
+					}
+					// If SSE closes, unblock all waiters with an error
+					mu.Lock()
+					for k, ch := range pending {
+						delete(pending, k)
+						resp := JsonRPC{
+							JSONRPC: "2.0",
+							ID:      k,
+							Error: &RPCError{
+								Code:    -32000,
+								Message: "upstream SSE closed",
+							},
+						}
+						select {
+						case ch <- resp:
+						default:
+						}
+					}
+					mu.Unlock()
+
+					// Reconnect SSE for future requests.
+					backoff := 500 * time.Millisecond
+					for {
+						if ctx.Err() != nil {
+							return
+						}
+						newEP, rerr := sseMgr.reconnect(ctx, httpClient, remote, bearer, logger)
+						if rerr == nil {
+							if !sseMgr.waitForSwitch(2 * time.Second) {
+								logger.Printf("SSE switch ack timed out; continuing")
+							}
+							logger.Printf("SSE reconnected. new endpoint=%s", newEP)
+							if forwardInit {
+								initTracker.reinitialize(ctx, httpClient, sseMgr.endpoint, bearer, logger, &mu, pending)
+							}
+							activeCh = sseMgr.msgCh()
+							break
+						}
+						logger.Printf("SSE reconnect failed: %v", rerr)
+						time.Sleep(backoff)
+						if backoff < 5*time.Second {
+							backoff *= 2
+						}
+					}
+					continue
+				}
+				if msg.ID == nil {
+					continue
+				}
+				idKey := idToKey(msg.ID)
+
+				mu.Lock()
+				ch := pending[idKey]
+				mu.Unlock()
+				if ch != nil {
+					select {
+					case ch <- msg:
+					default:
+					}
+				}
+			}
+		}
+	}()
 
 	// detect framing style from first message
 	firstMsg, style, err := readAnyMessage(in)
@@ -111,7 +166,7 @@ func main() {
 		logger.Printf("failed to read first message: %v", err)
 		os.Exit(1)
 	}
-	if err := handleOne(ctx, httpClient, endpointURL, bearer, logger, firstMsg, &mu, pending, out, style); err != nil {
+	if err := handleOne(ctx, httpClient, sseMgr, bearer, logger, firstMsg, &mu, &outMu, pending, initTracker, forwardInit, oneShotTools, out, style, remote); err != nil {
 		logger.Printf("handle error: %v", err)
 	}
 
@@ -124,7 +179,7 @@ func main() {
 			logger.Printf("read error: %v", err)
 			return
 		}
-		if err := handleOne(ctx, httpClient, endpointURL, bearer, logger, msg, &mu, pending, out, style); err != nil {
+		if err := handleOne(ctx, httpClient, sseMgr, bearer, logger, msg, &mu, &outMu, pending, initTracker, forwardInit, oneShotTools, out, style, remote); err != nil {
 			logger.Printf("handle error: %v", err)
 		}
 	}
@@ -133,49 +188,53 @@ func main() {
 func handleOne(
 	ctx context.Context,
 	httpClient *http.Client,
-	endpointURL string,
+	sseMgr *sseManager,
 	bearer string,
 	logger *log.Logger,
 	req JsonRPC,
 	mu *sync.Mutex,
+	outMu *sync.Mutex,
 	pending map[string]chan JsonRPC,
+	initTracker *upstreamInitTracker,
+	forwardInit bool,
+	oneShotTools bool,
 	out *bufio.Writer,
 	style string,
+	// 为了重连：需要 remote SSE url
+	remoteSSE string,
 ) error {
 	if req.JSONRPC == "" {
 		req.JSONRPC = "2.0"
 	}
 
-	// 1) Codex 启动阶段：短路 initialize，避免等待上游 legacy 反应（否则会 boot 超时）
+	// 1) short-circuit initialize
 	if req.Method == "initialize" {
-		// Minimal InitializeResult for MCP (enough for Codex to proceed)
 		result := json.RawMessage([]byte(`{
 			"protocolVersion":"2025-03-26",
 			"capabilities": { "tools": {} },
-			"serverInfo": { "name":"legacy-sse-bridge", "version":"0.1.0" }
+			"serverInfo": { "name":"legacy-sse-bridge", "version":"0.1.1" }
 		}`))
-		resp := JsonRPC{
-			JSONRPC: "2.0",
-			ID:      req.ID,
-			Result:  &result,
-		}
-		if err := writeMessage(out, resp, style); err != nil {
+		resp := JsonRPC{JSONRPC: "2.0", ID: req.ID, Result: &result}
+		if err := writeMessageLocked(outMu, out, resp, style); err != nil {
 			return err
 		}
-		go bestEffortPost(ctx, httpClient, endpointURL, bearer, req, logger, "initialize")
+		if forwardInit {
+			initTracker.start(ctx, httpClient, sseMgr.endpoint, bearer, logger, req, mu, pending)
+		}
 		return nil
 	}
 
-	// 2) 客户端可能会发 initialized 通知：吞掉即可
+	// 2) swallow initialized
 	if req.Method == "initialized" {
-		go bestEffortPost(ctx, httpClient, endpointURL, bearer, req, logger, "initialized")
+		if forwardInit {
+			initTracker.wait(defaultInitTimeout())
+			go bestEffortPost(ctx, httpClient, sseMgr.endpoint(), bearer, req, logger, "initialized")
+		}
 		return nil
 	}
 
-	// 3) tools/list：本地返回你这个 MCP 服务的工具清单（让 Codex 能看到工具）
-	// MCP 标准方法名是 "tools/list"
+	// 3) tools/list local
 	if req.Method == "tools/list" {
-		// 你后台页面显示的工具：expand_search_keyword
 		result := json.RawMessage([]byte(`{
 			"tools": [
 				{
@@ -191,23 +250,48 @@ func handleOne(
 				}
 			]
 		}`))
-		resp := JsonRPC{
-			JSONRPC: "2.0",
-			ID:      req.ID,
-			Result:  &result,
-		}
-		return writeMessage(out, resp, style)
+		resp := JsonRPC{JSONRPC: "2.0", ID: req.ID, Result: &result}
+		return writeMessageLocked(outMu, out, resp, style)
 	}
 
-	// 4) Notification (no id) - best effort forward
+	if oneShotTools && req.Method == "tools/call" && req.ID != nil {
+		var lastErr error
+		for i := 0; i < oneShotAttempts(); i++ {
+			if i > 0 {
+				time.Sleep(reconnectPostDelay())
+			}
+			if resp, err := callWithFreshSession(ctx, httpClient, remoteSSE, bearer, req, timeoutFromEnv(), logger, true); err == nil {
+				resp.ID = req.ID
+				if resp.JSONRPC == "" {
+					resp.JSONRPC = "2.0"
+				}
+				return writeMessageLocked(outMu, out, resp, style)
+			} else {
+				lastErr = err
+			}
+		}
+		if lastErr != nil {
+			logger.Printf("one-shot tools/call failed after %d attempts: %v", oneShotAttempts(), lastErr)
+		}
+	}
+
+	// Notification (no id)
 	if req.ID == nil {
-		if err := postJSONRPC(ctx, httpClient, endpointURL, bearer, req); err != nil {
+		if forwardInit {
+			initTracker.wait(defaultInitTimeout())
+		}
+		ep := sseMgr.endpoint()
+		if err := postJSONRPC(ctx, httpClient, ep, bearer, req); err != nil {
 			logger.Printf("notify forward failed: %v", err)
 		}
 		return nil
 	}
 
-	// 5) 有 id 的请求：正常走“转发上游 + 等 SSE 回包”的逻辑
+	if forwardInit && !initTracker.wait(defaultInitTimeout()) {
+		logger.Printf("upstream initialize not ready after %s; continuing", defaultInitTimeout())
+	}
+
+	// Request with id
 	idKey := idToKey(req.ID)
 	ch := make(chan JsonRPC, 1)
 
@@ -219,25 +303,8 @@ func handleOne(
 		mu.Lock()
 		delete(pending, idKey)
 		mu.Unlock()
-		close(ch)
 	}()
 
-	logger.Printf(">> to upstream method=%s id=%v", req.Method, req.ID)
-
-	// Send upstream
-	if err := postJSONRPC(ctx, httpClient, endpointURL, bearer, req); err != nil {
-		resp := JsonRPC{
-			JSONRPC: "2.0",
-			ID:      req.ID,
-			Error: &RPCError{
-				Code:    -32001,
-				Message: "upstream POST failed: " + err.Error(),
-			},
-		}
-		return writeMessage(out, resp, style)
-	}
-
-	// Wait response from SSE
 	timeout := 120 * time.Second
 	if v := strings.TrimSpace(os.Getenv("UPSTREAM_TIMEOUT")); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
@@ -245,27 +312,128 @@ func handleOne(
 		}
 	}
 
-	select {
-	case resp := <-ch:
-		logger.Printf("<< from upstream id=%v hasResult=%v hasError=%v", resp.ID, resp.Result != nil, resp.Error != nil)
+	// helper: send+wait once
+	sendOnce := func() (JsonRPC, error) {
+		ep := sseMgr.endpoint()
+		logger.Printf(">> to upstream method=%s id=%v endpoint=%s", req.Method, req.ID, ep)
 
-		resp.ID = req.ID // 保持 id 类型一致（Codex 有时要求）
+		if err := postJSONRPC(ctx, httpClient, ep, bearer, req); err != nil {
+			return JsonRPC{}, err
+		}
+
+		select {
+		case resp := <-ch:
+			return resp, nil
+		case <-time.After(timeout):
+			return JsonRPC{}, fmt.Errorf("timeout waiting upstream response")
+		}
+	}
+
+	// try #1
+	resp, err := sendOnce()
+	if err == nil {
+		logger.Printf("<< from upstream id=%v hasResult=%v hasError=%v", resp.ID, resp.Result != nil, resp.Error != nil)
+		resp.ID = req.ID
 		if resp.JSONRPC == "" {
 			resp.JSONRPC = "2.0"
 		}
-		return writeMessage(out, resp, style)
+		return writeMessageLocked(outMu, out, resp, style)
+	}
 
-	case <-time.After(timeout):
-		resp := JsonRPC{
+	// If error indicates SessionId invalid, reconnect SSE and retry once
+	errStr := err.Error()
+	if strings.Contains(errStr, "SessionId invalid") || strings.Contains(errStr, "sessionid invalid") {
+		if resp0, err0 := callWithFreshSession(ctx, httpClient, remoteSSE, bearer, req, timeout, logger, true); err0 == nil {
+			logger.Printf("<< from upstream(one-shot) id=%v hasResult=%v hasError=%v", resp0.ID, resp0.Result != nil, resp0.Error != nil)
+			resp0.ID = req.ID
+			if resp0.JSONRPC == "" {
+				resp0.JSONRPC = "2.0"
+			}
+			return writeMessageLocked(outMu, out, resp0, style)
+		}
+
+		logger.Printf("upstream session invalid, reconnecting SSE then retrying once...")
+
+		// reconnect SSE to get a new endpoint (new sessionId)
+		newEP, rerr := sseMgr.reconnect(ctx, httpClient, remoteSSE, bearer, logger)
+		if rerr != nil {
+			// can't recover
+			resp := JsonRPC{
+				JSONRPC: "2.0",
+				ID:      req.ID,
+				Error: &RPCError{
+					Code:    -32001,
+					Message: "upstream POST failed and reconnect failed: " + rerr.Error(),
+				},
+			}
+			return writeMessageLocked(outMu, out, resp, style)
+		}
+		if !sseMgr.waitForSwitch(2 * time.Second) {
+			logger.Printf("SSE switch ack timed out; continuing")
+		}
+		logger.Printf("reconnected. new endpoint=%s", newEP)
+		if forwardInit {
+			initTracker.reinitialize(ctx, httpClient, sseMgr.endpoint, bearer, logger, mu, pending)
+		}
+		if d := reconnectPostDelay(); d > 0 {
+			time.Sleep(d)
+		}
+
+		// retry #2
+		resp2, err2 := sendOnce()
+		if err2 == nil {
+			logger.Printf("<< from upstream(after retry) id=%v hasResult=%v hasError=%v", resp2.ID, resp2.Result != nil, resp2.Error != nil)
+			resp2.ID = req.ID
+			if resp2.JSONRPC == "" {
+				resp2.JSONRPC = "2.0"
+			}
+			return writeMessageLocked(outMu, out, resp2, style)
+		}
+
+		if strings.Contains(err2.Error(), "SessionId invalid") || strings.Contains(err2.Error(), "sessionid invalid") {
+			if resp3, err3 := callWithFreshSession(ctx, httpClient, remoteSSE, bearer, req, timeout, logger, false); err3 == nil {
+				logger.Printf("<< from upstream(one-shot) id=%v hasResult=%v hasError=%v", resp3.ID, resp3.Result != nil, resp3.Error != nil)
+				resp3.ID = req.ID
+				if resp3.JSONRPC == "" {
+					resp3.JSONRPC = "2.0"
+				}
+				return writeMessageLocked(outMu, out, resp3, style)
+			}
+		}
+
+		// still failing after retry
+		respFail := JsonRPC{
 			JSONRPC: "2.0",
 			ID:      req.ID,
 			Error: &RPCError{
-				Code:    -32002,
-				Message: "timeout waiting upstream response",
+				Code:    -32001,
+				Message: "upstream failed after reconnect+retry: " + err2.Error(),
 			},
 		}
-		return writeMessage(out, resp, style)
+		return writeMessageLocked(outMu, out, respFail, style)
 	}
+
+	if strings.Contains(errStr, "upstream SSE closed") {
+		if resp, err := callWithFreshSession(ctx, httpClient, remoteSSE, bearer, req, timeout, logger, true); err == nil {
+			logger.Printf("<< from upstream(one-shot after SSE closed) id=%v hasResult=%v hasError=%v", resp.ID, resp.Result != nil, resp.Error != nil)
+			resp.ID = req.ID
+			if resp.JSONRPC == "" {
+				resp.JSONRPC = "2.0"
+			}
+			return writeMessageLocked(outMu, out, resp, style)
+		}
+	}
+
+	// generic error
+	respErr := JsonRPC{
+		JSONRPC: "2.0",
+		ID:      req.ID,
+		Error: &RPCError{
+			Code:    -32001,
+			Message: "upstream POST failed: " + errStr,
+		},
+	}
+	return writeMessageLocked(outMu, out, respErr, style)
 }
 
 func connectLegacySSE(
@@ -384,6 +552,87 @@ func connectLegacySSE(
 	}
 }
 
+type sseManager struct {
+	mu          sync.Mutex
+	endpointVal atomic.Value
+	msgChVal    atomic.Value
+	switchCh    chan struct{}
+	switchAck   chan struct{}
+	cancel      context.CancelFunc
+}
+
+func newSSEManager(endpoint string) *sseManager {
+	m := &sseManager{
+		switchCh:  make(chan struct{}, 1),
+		switchAck: make(chan struct{}, 1),
+	}
+	m.endpointVal.Store(endpoint)
+	return m
+}
+
+func (m *sseManager) endpoint() string {
+	v := m.endpointVal.Load()
+	if v == nil {
+		return ""
+	}
+	return v.(string)
+}
+
+func (m *sseManager) msgCh() <-chan JsonRPC {
+	v := m.msgChVal.Load()
+	if v == nil {
+		return nil
+	}
+	return v.(<-chan JsonRPC)
+}
+
+func (m *sseManager) set(endpoint string, msgCh <-chan JsonRPC, cancel context.CancelFunc) {
+	m.endpointVal.Store(endpoint)
+	m.msgChVal.Store(msgCh)
+	m.cancel = cancel
+	select {
+	case m.switchCh <- struct{}{}:
+	default:
+	}
+}
+
+func (m *sseManager) waitForSwitch(timeout time.Duration) bool {
+	if timeout <= 0 {
+		timeout = 2 * time.Second
+	}
+	select {
+	case <-m.switchAck:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
+func (m *sseManager) reconnect(
+	parent context.Context,
+	client *http.Client,
+	remote string,
+	bearer string,
+	logger *log.Logger,
+) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.cancel != nil {
+		m.cancel()
+		m.cancel = nil
+	}
+
+	ctx, cancel := context.WithCancel(parent)
+	_, endpoint, msgCh, err := connectLegacySSE(ctx, client, remote, bearer, logger)
+	if err != nil {
+		cancel()
+		return "", err
+	}
+	m.set(endpoint, msgCh, cancel)
+	return endpoint, nil
+}
+
 func postJSONRPC(ctx context.Context, client *http.Client, endpoint string, bearer string, msg JsonRPC) error {
 	b, err := json.Marshal(msg)
 	if err != nil {
@@ -428,6 +677,142 @@ func bestEffortPost(
 	if err := postJSONRPC(ctx, client, endpoint, bearer, msg); err != nil {
 		logger.Printf("best-effort %s forward failed: %v", label, err)
 	}
+}
+
+type upstreamInitTracker struct {
+	started atomic.Bool
+	ready   chan struct{}
+	lastReq atomic.Value // JsonRPC
+}
+
+func newUpstreamInitTracker() *upstreamInitTracker {
+	return &upstreamInitTracker{ready: make(chan struct{})}
+}
+
+func (t *upstreamInitTracker) start(
+	ctx context.Context,
+	client *http.Client,
+	endpointFn func() string,
+	bearer string,
+	logger *log.Logger,
+	req JsonRPC,
+	mu *sync.Mutex,
+	pending map[string]chan JsonRPC,
+) {
+	initReq := req
+	initReq.ID = fmt.Sprintf("bridge-init-%d", time.Now().UnixNano())
+	t.lastReq.Store(initReq)
+
+	if t.started.Swap(true) {
+		return
+	}
+	go func() {
+		defer close(t.ready)
+		if !t.sendAndWait(ctx, client, endpointFn, bearer, logger, initReq, mu, pending) {
+			logger.Printf("upstream initialize did not complete before timeout")
+		}
+	}()
+}
+
+func (t *upstreamInitTracker) reinitialize(
+	ctx context.Context,
+	client *http.Client,
+	endpointFn func() string,
+	bearer string,
+	logger *log.Logger,
+	mu *sync.Mutex,
+	pending map[string]chan JsonRPC,
+) {
+	if !t.started.Load() {
+		return
+	}
+	v := t.lastReq.Load()
+	initReq, ok := v.(JsonRPC)
+	if !ok {
+		return
+	}
+	if !t.sendAndWait(ctx, client, endpointFn, bearer, logger, initReq, mu, pending) {
+		logger.Printf("upstream re-initialize did not complete before timeout")
+	}
+}
+
+func (t *upstreamInitTracker) wait(timeout time.Duration) bool {
+	if !t.started.Load() {
+		return true
+	}
+	select {
+	case <-t.ready:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
+func (t *upstreamInitTracker) sendAndWait(
+	ctx context.Context,
+	client *http.Client,
+	endpointFn func() string,
+	bearer string,
+	logger *log.Logger,
+	req JsonRPC,
+	mu *sync.Mutex,
+	pending map[string]chan JsonRPC,
+) bool {
+	ep := endpointFn()
+	idKey := idToKey(req.ID)
+	ch := make(chan JsonRPC, 1)
+
+	mu.Lock()
+	pending[idKey] = ch
+	mu.Unlock()
+
+	defer func() {
+		mu.Lock()
+		delete(pending, idKey)
+		mu.Unlock()
+		close(ch)
+	}()
+
+	if err := postJSONRPC(ctx, client, ep, bearer, req); err != nil {
+		logger.Printf("upstream initialize forward failed: %v", err)
+		return false
+	}
+
+	select {
+	case <-ch:
+		return true
+	case <-time.After(defaultInitTimeout()):
+		return false
+	}
+}
+
+func defaultInitTimeout() time.Duration {
+	timeout := 8 * time.Second
+	if v := strings.TrimSpace(os.Getenv("UPSTREAM_INIT_TIMEOUT")); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			timeout = d
+		}
+	}
+	return timeout
+}
+
+func timeoutFromEnv() time.Duration {
+	timeout := 120 * time.Second
+	if v := strings.TrimSpace(os.Getenv("UPSTREAM_TIMEOUT")); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			timeout = d
+		}
+	}
+	return timeout
+}
+
+func oneShotAttempts() int {
+	if v := strings.TrimSpace(os.Getenv("ONE_SHOT_MAX_RETRIES")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 3
 }
 
 func idToKey(id any) string {
@@ -519,4 +904,85 @@ func writeMessage(w *bufio.Writer, msg JsonRPC, style string) error {
 		return err
 	}
 	return w.Flush()
+}
+
+func writeMessageLocked(mu *sync.Mutex, w *bufio.Writer, msg JsonRPC, style string) error {
+	mu.Lock()
+	defer mu.Unlock()
+	return writeMessage(w, msg, style)
+}
+
+func envBool(name string, defaultValue bool) bool {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return defaultValue
+	}
+	switch strings.ToLower(v) {
+	case "1", "true", "yes", "y", "on":
+		return true
+	case "0", "false", "no", "n", "off":
+		return false
+	default:
+		return defaultValue
+	}
+}
+
+func reconnectPostDelay() time.Duration {
+	ms := strings.TrimSpace(os.Getenv("RECONNECT_POST_DELAY_MS"))
+	if ms == "" {
+		return 300 * time.Millisecond
+	}
+	v, err := time.ParseDuration(ms + "ms")
+	if err != nil {
+		return 300 * time.Millisecond
+	}
+	return v
+}
+
+func callWithFreshSession(
+	parent context.Context,
+	client *http.Client,
+	remoteSSE string,
+	bearer string,
+	req JsonRPC,
+	timeout time.Duration,
+	logger *log.Logger,
+	delay bool,
+) (JsonRPC, error) {
+	ctx, cancel := context.WithCancel(parent)
+	defer cancel()
+
+	_, endpoint, msgCh, err := connectLegacySSE(ctx, client, remoteSSE, bearer, logger)
+	if err != nil {
+		return JsonRPC{}, err
+	}
+
+	if delay {
+		time.Sleep(reconnectPostDelay())
+	}
+
+	respCh := make(chan JsonRPC, 1)
+	idKey := idToKey(req.ID)
+	go func() {
+		for msg := range msgCh {
+			if msg.ID == nil {
+				continue
+			}
+			if idToKey(msg.ID) == idKey {
+				respCh <- msg
+				return
+			}
+		}
+	}()
+
+	if err := postJSONRPC(ctx, client, endpoint, bearer, req); err != nil {
+		return JsonRPC{}, err
+	}
+
+	select {
+	case resp := <-respCh:
+		return resp, nil
+	case <-time.After(timeout):
+		return JsonRPC{}, fmt.Errorf("timeout waiting upstream response")
+	}
 }
