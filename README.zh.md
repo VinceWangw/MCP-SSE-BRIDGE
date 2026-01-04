@@ -24,6 +24,13 @@ REMOTE_BEARER_TOKEN="..." \
 ./mcp-sse-bridge
 ```
 
+## 冒烟测试
+```bash
+REMOTE_SSE_URL="https://host/mcp-servers/example" \
+REMOTE_BEARER_TOKEN="..." \
+./scripts/smoke.sh
+```
+
 ## 配置
 必填：
 - `REMOTE_SSE_URL`：上游 SSE 地址，需要发送 `endpoint` 和 `message` 事件。
@@ -44,5 +51,8 @@ REMOTE_BEARER_TOKEN="..." \
 - `LOCAL_TOOLS_LIST=false` 时，`tools/list` 会转发到上游。
 
 ## 仓库结构
-- `main.go`：全部桥接逻辑。
+- `main.go`：入口。
+- `bridge/`：stdio 循环与上游协调。
+- `sse/`：SSE 连接与会话管理。
+- `rpc/`：JSON-RPC 类型与 stdio framing。
 - `go.mod`：模块定义。

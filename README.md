@@ -25,6 +25,13 @@ REMOTE_BEARER_TOKEN="..." \
 ./mcp-sse-bridge
 ```
 
+## Smoke Test
+```bash
+REMOTE_SSE_URL="https://host/mcp-servers/example" \
+REMOTE_BEARER_TOKEN="..." \
+./scripts/smoke.sh
+```
+
 ## Configuration
 Required:
 - `REMOTE_SSE_URL`: SSE endpoint that emits `endpoint` and `message` events.
@@ -45,5 +52,8 @@ Optional:
 - With `LOCAL_TOOLS_LIST=false`, `tools/list` is forwarded to upstream.
 
 ## Repository Layout
-- `main.go`: all bridge logic.
+- `main.go`: entrypoint.
+- `bridge/`: stdio loop and upstream coordination.
+- `sse/`: SSE connection and session manager.
+- `rpc/`: JSON-RPC types and stdio framing helpers.
 - `go.mod`: module definition.

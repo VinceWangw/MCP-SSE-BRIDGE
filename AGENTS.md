@@ -1,7 +1,10 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- `main.go` contains the entire bridge implementation (stdio ↔ legacy SSE proxy).
+- `main.go` is the entrypoint and delegates to `bridge/`.
+- `bridge/` contains the stdio loop and upstream coordination.
+- `sse/` contains SSE connection and session management helpers.
+- `rpc/` contains JSON-RPC types and stdio framing helpers.
 - `go.mod` defines the Go module (`mcp-sse-bridge`) and Go version.
 - `mcp-sse-bridge` is the built binary (if present) and can be regenerated.
 
@@ -26,7 +29,7 @@
 ## Coding Style & Naming Conventions
 - Use standard Go formatting (`gofmt`); indentation is tabs by default.
 - Names follow Go conventions: `CamelCase` for exported, `camelCase` for local.
-- Keep JSON-RPC shapes and HTTP/SSE wiring in `main.go`; add small helpers near use.
+- Keep JSON-RPC shapes in `rpc/` and SSE wiring in `sse/`; keep orchestration in `bridge/`.
 
 ## Testing Guidelines
 - No tests are present in this repository.
