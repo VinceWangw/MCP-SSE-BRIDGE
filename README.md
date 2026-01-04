@@ -20,7 +20,7 @@ go build -o mcp-sse-bridge .
 
 ## Run
 ```bash
-REMOTE_SSE_URL="https://host/mcp-servers/keyword-expand" \
+REMOTE_SSE_URL="https://host/mcp-servers/example" \
 REMOTE_BEARER_TOKEN="..." \
 ./mcp-sse-bridge
 ```
@@ -37,10 +37,12 @@ Optional:
 - `RECONNECT_POST_DELAY_MS`: Delay before retry after reconnect (default: 300).
 - `ONE_SHOT_TOOLS`: Run each `tools/call` with a fresh SSE session (default: true).
 - `ONE_SHOT_MAX_RETRIES`: Max attempts for one-shot calls (default: 3).
+- `LOCAL_TOOLS_LIST`: Serve a local hardcoded `tools/list` response (default: false).
 
 ## Notes
 - The bridge logs to stderr and emits JSON-RPC to stdout.
 - Reconnects switch to a new SSE stream and re-send upstream initialize.
+- With `LOCAL_TOOLS_LIST=false`, `tools/list` is forwarded to upstream.
 
 ## Repository Layout
 - `main.go`: all bridge logic.

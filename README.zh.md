@@ -19,7 +19,7 @@ go build -o mcp-sse-bridge .
 
 ## 运行
 ```bash
-REMOTE_SSE_URL="https://host/mcp-servers/keyword-expand" \
+REMOTE_SSE_URL="https://host/mcp-servers/example" \
 REMOTE_BEARER_TOKEN="..." \
 ./mcp-sse-bridge
 ```
@@ -36,10 +36,12 @@ REMOTE_BEARER_TOKEN="..." \
 - `RECONNECT_POST_DELAY_MS`：重连后重试前的等待毫秒数（默认 300）。
 - `ONE_SHOT_TOOLS`：每次 `tools/call` 使用独立 SSE 会话（默认 true）。
 - `ONE_SHOT_MAX_RETRIES`：one-shot 最大尝试次数（默认 3）。
+- `LOCAL_TOOLS_LIST`：是否返回本地硬编码的 `tools/list`（默认 false）。
 
 ## 说明
 - stderr 输出日志，stdout 输出 JSON-RPC。
 - 重连会切换到新的 SSE 通道，并补发上游 initialize。
+- `LOCAL_TOOLS_LIST=false` 时，`tools/list` 会转发到上游。
 
 ## 仓库结构
 - `main.go`：全部桥接逻辑。

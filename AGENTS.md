@@ -12,7 +12,7 @@
 - `go run ./...` runs the bridge locally for quick iteration.
 - Example run:
   ```bash
-  REMOTE_SSE_URL="https://host/mcp-servers/keyword-expand" \
+  REMOTE_SSE_URL="https://host/mcp-servers/example" \
   REMOTE_BEARER_TOKEN="..." \
   go run ./...
   ```
@@ -21,6 +21,7 @@
 - Optional: `RECONNECT_POST_DELAY_MS=300` delays the retry after reconnect.
 - Optional: `ONE_SHOT_TOOLS=true` runs each `tools/call` with a fresh SSE session.
 - Optional: `ONE_SHOT_MAX_RETRIES=3` controls one-shot retry attempts.
+- Optional: `LOCAL_TOOLS_LIST=true` serves a local hardcoded `tools/list` response (default false).
 
 ## Coding Style & Naming Conventions
 - Use standard Go formatting (`gofmt`); indentation is tabs by default.
@@ -40,4 +41,5 @@
 ## Configuration & Runtime Notes
 - Required env: `REMOTE_SSE_URL`.
 - Optional env: `REMOTE_BEARER_TOKEN`, `UPSTREAM_TIMEOUT`.
+- Optional env: `LOCAL_TOOLS_LIST` to force a local `tools/list` response.
 - The bridge is long-running; prefer logging to stderr and JSON-RPC on stdout.
